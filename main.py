@@ -1,84 +1,49 @@
-'''
-    pip install fastapi uvicorn pydantic
-    python.exe -m pip install --upgrade pip
-
-    fastapi: 빠르고 간편한 파이선 프레임워크
-    uvicorn: 서버를 실행 시켜주는 도구
-    pydantic: 프론트엔드에서 넘어온 메시지 형식이 맞는지 검사
-'''
+import json
+import logging
+import os
+import re
 
 from dotenv import load_dotenv
-
-'''
-    FastAPI 라이브러리에서 FastAPI 클래스를 가져오고
-    파이썬으로 API 서버를 빠르게 만들 수 있게 해주는 도구
-'''
-
-from fastapi import FastAPI
-
-'''
-    CORS(Cross-Origin Resource Sharing) 미들웨어를 가져옵니다.
-    미들웨어란 요청과 응답 사이에서 중간 처리를 담당하는 기능
-    "다른 주소(포트)에서 오는 요청을 허용할지 말지"를 결정하는 보안 정책
-'''
-
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from groq import APIError, Groq
+from pydantic import BaseModel, Field
+from requests import RequestException
 
-'''
-    pydantic 라이브러리에서 BaseModel 클래스를 가져옵니다
-'''
+from kakao_search import search_kakao_places
 
-from pydantic import BaseModel
-import os
-
-# ai가 보내준 json 문자열 데이터를 파이썬 딕셔너리로 변환
-import json
-
-# 리스트나 선택적 값 같은 데이터 타입을 명확히 지정하기 위해 타이핑 모듈을 가져온다
-from typing import List, Optional
-
-from pathlib import Path
-
-#
-from groq import Groq
-
-# 같은 폴더에 있는 걸 로드
 load_dotenv()
 
-# https://console.groq.com/
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+logger = logging.getLogger("uvicorn.error")
+groq_api_key = os.getenv("GROQ_API_KEY")
+client = Groq(api_key=groq_api_key, timeout=20.0, max_retries=0) if groq_api_key else None
+groq_model = "openai/gpt-oss-120b"
+station_pattern = re.compile(r"(?<![가-힣])(?!(?:지역|구역|전역|광역|권역))([가-힣]+역)")
 
-# 만약 설정이 안되어 있으면
-if not GROQ_API_KEY:
-    print("warning: .env 파일에서 API Key를 찾을 수 없습니다")
-
-# 꺼내온 API 키로 Groq 클라이언트 생성
-client = Groq(api_key=GROQ_API_KEY)
+default_origins = "http://localhost:3000,http://heartbreakkid.co.kr,https://heartbreakkid.co.kr"
+allowed_origins = [
+    origin.strip().rstrip("/")
+    for origin in os.getenv("CORS_ORIGINS", default_origins).split(",")
+    if origin.strip()
+]
 
 app = FastAPI()
-'''
-    fastapi 앱(서버) 인스턴스를 생성
-'''
-
-frontend_origin = (
-    "http://heartbreakkid.co.kr" if os.getenv("RENDER") == "true" else "http://localhost:3000"
-)
-
-# app에 cors 미들웨어를 추가
 app.add_middleware(
-    CORSMiddleware, # 사용할 미들웨어 종류 지정
-    allow_origins=[frontend_origin],
-    allow_credentials=True, # 쿠키나 인증정보(credentials)를 요청에 포함하는 것을 허용
-    allow_methods=["*"], # 허용할 http메서드를 지정
-    allow_headers=["*"], # 허용할 http 헤더를 지정
+    CORSMiddleware,
+    allow_origins=allowed_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# 프론트엔드에서 서버로 보내는 요청(req)데이터의 구조를 정의
-class ChatRequest(BaseModel):
-    message: str # 사용자가 입력하는 채팅 메시지를 받는 필드 str은 문자열 텍스트 타입
-    district: str # 사용자가 선택한 지역
 
-# 다음 카카오 맵의 마커 아이콘을 찍기 위해 개별 장소의 데이터 구조를 정의
+class ChatRequest(BaseModel):
+    message: str
+    district: str
+    previous_places: list[str] = Field(default_factory=list)
+    previous_query: str = ""
+
+
 class PlaceInfo(BaseModel):
     name: str
     category: str
@@ -88,118 +53,145 @@ class PlaceInfo(BaseModel):
     is_registered: bool
     description: str
 
+
 class ChatResponse(BaseModel):
     reply: str
-    # 프론트엔드가 지도를 화면에 띄울지 말지 결정하는 상태 값
     show_map: bool = False
-    # 지도에 표시할 맛집/학원 장소들의 배열 데이터
-    places: List[PlaceInfo] = []
+    places: list[PlaceInfo] = Field(default_factory=list)
 
-'''
-    /api/chat 경로로 post 요청이 들어왔을 때 실행 될 함수를 등록
-'''
-@app.post("/api/chat", response_model=ChatResponse)
-# 실제 요청을 처리하는 비동기 함수 여러 요청을 동시에 효율적으로 처리
-async def chat_endpoint(request: ChatRequest):
-    # request 객체에서 사용자가 보낸 메시지 텍스트만 꺼내 변수에 저장
-    user_message = request.message
-    user_district = request.district
 
-    system_prompt = (
-        f"당신은 지역의 장소를 잘 아는 친절한 장소 추천 AI 에이전트 누비니입니다. 사용자가 선택한 지역은 {user_district} 입니다."
-        "누비니의 뜻은 전국을 누비고 다닌다는 의미입니다"
-        "사용자가 질문을 하면 지역 내의 실제 유명한 식당 이름, 위치, 대표 메뉴, "
-        "분위기나 특징을 포함해 친근하고 보기 쉽게 답변해 주세요. "
-        "반드시 완벽하고 자연스러운 한국어로만 답변하세요."
-        """
-            [답변 작성 및 줄바꿈 규칙]
-        
-            1. 사용자가 읽기 편하도록 답변을 문단별로 구분하세요.
-            2. 서로 다른 주제나 설명은 반드시 빈 줄로 구분하세요.
-            3. 장소를 여러 개 추천할 경우 번호가 있는 마크다운 목록을 사용하세요.
-               장소는 기본적으로 3곳을 추천하고, 사용자의 요청이 있을 때(예시: n곳 추천해줘) 최대 7건 이하로 추천해주세요
-            4. 각 장소의 이름, 위치, 대표 메뉴, 특징을 보기 좋게 구분하세요.
-            5. 각 장소의 설명이 끝나면 빈 줄을 넣으세요.
-            6. 긴 문장은 적절한 길이로 나누되, 문장 중간에서
-               무리하게 줄바꿈하지 마세요.
-            7. 한 문단은 가급적 2~3문장을 넘지 않도록 작성하세요.
-            8. JSON의 reply 문자열에 줄바꿈이 필요한 경우
-               JSON 이스케이프 문자 \\n을 사용하세요.
-            9. 친근하고 자연스러운 존댓말을 유지하세요.
-            10. 카카오맵 등록 여부와 관계없이 실제로 존재하는 장소만 추천하세요. 가상의 장소를 만들지 말고, 존재 여부가 불확실한 장소는 추천에서 제외하세요.
-        
-            위 규칙은 모든 답변에 적용합니다.
-        """
-        "친절함은 계속 유지해주세요 존댓말 사용 부탁드립니다."
-        "응답은 반드시 아래의 JSON 형식으로만 작성해야 합니다:\n"
-        "{\n"
-            '"reply": "사용자에게 보여줄 친절한 답변 (마크다운 문법 사용 가능)",\n'
-            '"show_map": true 또는 false (맛집, 학원, 카페, 식당, 장소 추천 등 지도가 필요한 질문이면 true, 일반 대화면 false),\n'
-            '"places": [\n'
-                "{\n"
-                    '"name": "업체명", \n'
-                    '"category": "맛집 또는 학원 등 카테고리", \n'
-                    '"address": "상세 주소", \n'
-                    '"lat": 37.6551 (실제 해당 지역의 대략적인 위도 숫자), \n'
-                    '"lng": 127.0614 (실제 해당 지역의 대략적인 경도 숫자), \n'
-                    '"is_registered": true 또는 false (유명 프랜차이즈나 다음맵에 등록된 유명 업체면 true, 숨은 골목식당이나 가상의 추천/미등록 업체면 false), \n'
-                    '"description": "대표 메뉴나 학원 특징 요약" \n'
-                "}\n"
-            "]\n"
-        "}\n"
-        "주의: 일반 대화(show_map이 false일 때)인 경우 places를 빈 배열 []로 보내세요"
+class SearchIntent(BaseModel):
+    keyword: str
+    is_place_request: bool
+
+
+@app.get("/healthz")
+def healthcheck():
+    return {"status": "ok"}
+
+
+def groq_json(groq_client: Groq, prompt: str, message: str, temperature: float) -> str:
+    completion = groq_client.chat.completions.create(
+        model=groq_model,
+        messages=[
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": message},
+        ],
+        temperature=temperature,
+        response_format={"type": "json_object"},
     )
+    return completion.choices[0].message.content or ""
 
-    # 에러가 발생했을 때를 대비해 기본 반환값 변수를 미리 초기화 해 둡니다
-    show_map_flag = False
-    places_list = []
 
-    try:
-        print(f"사용자 질문 수신: {user_message} -> Groq 초고속 응답 요청 중…")
+def recommend_places(request: ChatRequest, search_message: str, keyword: str) -> ChatResponse:
+    keyword = station_pattern.sub("", keyword).strip() or "맛집"
+    station_match = station_pattern.search(search_message)
 
-        chat_completion = client.chat.completions.create(
-            model="openai/gpt-oss-120b",
-            messages=[
-                # 1. 시스템 역할부여
-                {"role": "system", "content": system_prompt},
-                # 2. 사용자의 실제 질문 전달
-                {"role": "user", "content": user_message},
-            ],
-            temperature=0.6,
-            # json 형태로만 답하도록 설정
-            response_format={"type":"json_object"},
+    if station_match:
+        station_name = station_match.group(1)
+        station_results = search_kakao_places(station_name, 15)
+        station = next(
+            (
+                place for place in station_results
+                if place["name"] == station_name
+                or place["name"].startswith(station_name + " ")
+            ),
+            None,
         )
 
-        # ai가 생성한 답변 텍스트 꺼내기
-        raw_content = chat_completion.choices[0].message.content
-        print("Grog 응답 완료")
+        if not station:
+            return ChatResponse(reply=f"{station_name}의 위치를 찾지 못했어요.")
 
-        # [추가] AI가 보내준 JSON 문자열을 파이썬 딕셔너리 객체로 변환
-        parsed_data = json.loads(raw_content)
+        actual_district = next(
+            (
+                district for district in ["노원구", "도봉구", "중랑구", "강북구", "성북구"]
+                if district in station["address"]
+            ),
+            None,
+        )
+        if actual_district != request.district:
+            return ChatResponse(
+                reply=(
+                    f"{station_name}은(는) {actual_district or '다른 지역'}에 위치해 있어요! 😊\n\n"
+                    f"현재 선택하신 지역은 {request.district}입니다.\n\n"
+                    "상단에서 지역을 변경해 주세요."
+                )
+            )
 
-        # 파싱된 데이터에서 답변, 지도 표시여부, 장소 목록을 안전하게 꺼내기
-        ai_reply = parsed_data.get("reply", "답변을 생성하지 못하였습니다")
-        show_map_flag = parsed_data.get("show_map", False)
-        places_list = parsed_data.get("places", [])
+        results = search_kakao_places(
+            keyword, 15, x=station["lng"], y=station["lat"], radius=1000
+        )
+    else:
+        results = search_kakao_places(f"{request.district} {keyword}", 15)
 
-    except Exception as e:
-        print(f"Groq AI 호출 중 에러 발생: {e}")
-        ai_reply = "죄송합니다. 현재 AI 응답을 가져오는 중 문제가 발생했습니다. .env 파일의 GROQ_API_KEY 설정이나 서버 콘솔을 확인해 주세요."
-        show_map_flag = False
-        places_list = []
+    previous_names = set(request.previous_places)
+    places = [
+        PlaceInfo.model_validate(place)
+        for place in results
+        if request.district in place["address"] and place["name"] not in previous_names
+    ][:3]
 
-    # ChatResponse 객체를 생성해서 변환
-    return ChatResponse(reply=ai_reply, show_map=show_map_flag, places=places_list)
+    if not places:
+        return ChatResponse(reply="조건에 맞는 장소를 찾지 못했어요.\n\n지역이나 역 이름을 확인해 주세요.")
 
-# 구동 명령어 uvicorn main:app --reload
+    recommendations = "\n\n".join(
+        f"{index}. {place.name}\n위치: {place.address}"
+        for index, place in enumerate(places, 1)
+    )
+    return ChatResponse(
+        reply=f"추천 장소를 소개해 드릴게요! 😊\n\n{recommendations}",
+        show_map=True,
+        places=places,
+    )
 
-# source .venv/bin/activate
-# uvicorn main:app --reload --port 8000
 
-# 외부 접근 허용하게 하려면
-# allow_origins에 내부아이피 추가해야함
-# uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+@app.post("/api/chat", response_model=ChatResponse)
+def chat_endpoint(request: ChatRequest):
+    if client is None:
+        logger.error("GROQ_API_KEY is missing.")
+        raise HTTPException(status_code=503, detail="채팅 서비스가 설정되지 않았습니다.")
 
-# pip install openai langchain langchain-openai python-dotenv
+    search_message = request.message
+    if request.previous_query and any(
+        word in request.message for word in ("다른", "더 추천", "또 추천", "새로운")
+    ):
+        search_message = request.previous_query
 
-# pip install groq
+    try:
+        intent = SearchIntent.model_validate_json(groq_json(
+            client,
+            """
+            사용자의 질문을 분석하여 장소 검색어를 추출하세요.
+            음식 종류나 카페, 학원 같은 장소 종류를 검색어로 사용하세요.
+            특정 종류가 없으면 '맛집'을 사용하세요.
+            음식 종류를 임의로 변경하지 마세요.
+            장소 추천 요청이 아니면 is_place_request를 false로 설정하세요.
+            JSON 형식: {"keyword": "검색어", "is_place_request": true}
+            """,
+            search_message,
+            temperature=0,
+        ))
+
+        if not intent.is_place_request:
+            content = groq_json(
+                client,
+                f"""
+                당신은 친절한 지역 안내 AI 누비니입니다. 사용자가 선택한 지역은 {request.district}입니다.
+                누비니는 전국을 누비고 다닌다는 뜻입니다.
+                자연스러운 한국어 존댓말을 사용하고, 주제가 바뀔 때 빈 줄로 문단을 구분하세요.
+                일반 대화에 답하고, 실제 확인된 장소 정보가 필요한 질문에는 장소를 지어내지 마세요.
+                JSON 형식: {{"reply": "사용자에게 보여줄 답변"}}
+                """,
+                request.message,
+                temperature=0.6,
+            )
+            return ChatResponse(reply=json.loads(content)["reply"])
+    except (APIError, ValueError, TypeError, KeyError, IndexError) as exc:
+        logger.warning("Groq chat failed (%s).", type(exc).__name__)
+        return ChatResponse(reply="현재 AI 응답을 가져오지 못했어요. 잠시 후 다시 시도해 주세요.")
+
+    try:
+        return recommend_places(request, search_message, intent.keyword)
+    except (RequestException, ValueError, TypeError, KeyError) as exc:
+        logger.warning("Kakao place search failed (%s).", type(exc).__name__)
+        return ChatResponse(reply="현재 카카오 장소 검색을 이용할 수 없어요. 잠시 후 다시 시도해 주세요.")
