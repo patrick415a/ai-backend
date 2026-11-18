@@ -26,6 +26,16 @@ allowed_origins = [
     for origin in os.getenv("CORS_ORIGINS", default_origins).split(",")
     if origin.strip()
 ]
+site_aliases = {
+    "http://heartbreakkid.co.kr": "http://www.heartbreakkid.co.kr",
+    "http://www.heartbreakkid.co.kr": "http://heartbreakkid.co.kr",
+    "https://heartbreakkid.co.kr": "https://www.heartbreakkid.co.kr",
+    "https://www.heartbreakkid.co.kr": "https://heartbreakkid.co.kr",
+}
+for origin in allowed_origins.copy():
+    alias = site_aliases.get(origin)
+    if alias and alias not in allowed_origins:
+        allowed_origins.append(alias)
 
 app = FastAPI()
 app.add_middleware(
