@@ -6,6 +6,7 @@ import re
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from groq import APIError, Groq
 from pydantic import BaseModel, Field
 from requests import RequestException
@@ -47,6 +48,20 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def status_cors(request, call_next):
+    if request.url.path != "/api/status":
+        return await call_next(request)
+    response = Response(status_code=204) if request.method == "OPTIONS" else await call_next(request)
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    response.headers["Cache-Control"] = "no-store"
+    if "Access-Control-Allow-Credentials" in response.headers:
+        del response.headers["Access-Control-Allow-Credentials"]
+    return response
+
+
 class ChatRequest(BaseModel):
     message: str
     district: str
@@ -76,6 +91,7 @@ class SearchIntent(BaseModel):
 
 
 @app.get("/healthz")
+@app.get("/api/status")
 def healthcheck():
     return {"status": "ok"}
 
